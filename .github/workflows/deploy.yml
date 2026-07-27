@@ -1,0 +1,118 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/namcheai/buzz
+
+jobs:
+  push:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'success' &&
+      vars.DEPLOYS_ENABLED == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_ACTOR: ${{ github.actor }}
+    steps:
+      - name: Download CI-built OCI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: buzz-oci-${{ github.event.workflow_run.head_sha }}
+          path: /tmp
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push archive by immutable digest
+        id: push
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq skopeo
+          }
+          printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+          sha_tag="${IMAGE}:sha-${HEAD_SHA}"
+          skopeo copy --digestfile=/tmp/digest \
+            "oci-archive:/tmp/buzz-image.tar" "docker://${sha_tag}"
+          digest="$(cat /tmp/digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Malformed image digest: ${digest}"
+            exit 1
+          fi
+          echo "image=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+
+  staging:
+    needs: push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: staging
+    permissions:
+      contents: read
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      IMAGE_REF: ${{ needs.push.outputs.image }}
+    steps:
+      - name: Verify sha is current main HEAD
+        id: fresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/${REPO}/branches/main" --jq '.commit.sha')"
+          if [ "$current" = "$HEAD_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Superseded: main is at ${current}; this run built ${HEAD_SHA}."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release to staging (dispatch to infra)
+        if: steps.fresh.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::INFRA_DISPATCH_TOKEN is empty"
+            exit 1
+          fi
+          gh workflow run deploy-app.yml -R NamcheAI/infra --ref main \
+            -f app=buzz \
+            -f environment=staging \
+            -f image="$IMAGE_REF"
+          echo "::notice::Dispatched staging deploy of ${IMAGE_REF}."
+
+      - name: Record staged immutable image
+        if: steps.fresh.outputs.current == 'true'
+        run: printf '%s\n' "$IMAGE_REF" > "staged-image-${HEAD_SHA}.txt"
+
+      - name: Preserve staged digest for production
+        if: steps.fresh.outputs.current == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staged-digest-${{ github.event.workflow_run.head_sha }}
+          path: staged-image-${{ github.event.workflow_run.head_sha }}.txt
+          retention-days: 90
+          if-no-files-found: error
